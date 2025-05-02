@@ -7,8 +7,8 @@ from docx import Document
 import pandas as pd
 import numpy as np
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
+from sentence_transformers import SentenceTransformer
+import chromadb
 from langchain.docstore.document import Document as LangchainDocument
 
 # Initialize session state
@@ -22,7 +22,7 @@ if "file_dataframes" not in st.session_state:
     st.session_state.file_dataframes = {}
 
 # Streamlit app configuration
-st.set_page_config(page_title="OpenAI RAG Chat Assistant", page_icon="🤖")
+st.set_page_config(page_title="RAG Chat Assistant", page_icon="🤖")
 
 # Sidebar configuration
 with st.sidebar:
@@ -70,12 +70,25 @@ def process_files(uploaded_files, chunk_size=1000, chunk_overlap=200):
     return all_text
 
 # Function to create vector store
-def create_vector_store(text_chunks, api_key):
+def create_vector_store(text_chunks):
     try:
-        embeddings = OpenAIEmbeddings(api_key=api_key)
-        documents = [LangchainDocument(page_content=chunk) for chunk in text_chunks]
-        vector_store = FAISS.from_documents(documents, embeddings)
-        return vector_store
+        # Initialize Sentence Transformer model
+        embedder = SentenceTransformer('all-MiniLM-L6-v2')
+        
+        # Create Chroma client
+        chroma_client = chromadb.Client()
+        collection = chroma_client.create_collection(name="documents")
+        
+        # Generate embeddings and add to Chroma
+        embeddings = embedder.encode(text_chunks)
+        for i, (chunk, embedding) in enumerate(zip(text_chunks, embeddings)):
+            collection.add(
+                documents=[chunk],
+                embeddings=[embedding.tolist()],
+                ids=[f"doc_{i}"]
+            )
+        
+        return collection
     except Exception as e:
         st.error(f"Error creating vector store: {str(e)}")
         return None
@@ -84,12 +97,7 @@ def create_vector_store(text_chunks, api_key):
 if uploaded_files:
     st.session_state.processed_text = process_files(uploaded_files)
     if st.session_state.processed_text:
-        try:
-            openai_api_key = st.secrets["OPENAI_API_KEY"]
-            st.session_state.vector_store = create_vector_store(st.session_state.processed_text, openai_api_key)
-        except KeyError:
-            st.error("OPENAI_API_KEY not found in Streamlit secrets")
-            st.stop()
+        st.session_state.vector_store = create_vector_store(st.session_state.processed_text)
 
 # Function to retrieve row from CSV/Excel
 def retrieve_row(file_name, row_index):
@@ -155,9 +163,16 @@ if prompt := st.chat_input("Ask me anything..."):
         # RAG implementation
         context = ""
         if st.session_state.vector_store:
-            # Retrieve relevant chunks
-            docs = st.session_state.vector_store.similarity_search(prompt, k=3)
-            context = "\n\n".join([doc.page_content for doc in docs])
+            # Initialize Sentence Transformer for query embedding
+            embedder = SentenceTransformer('all-MiniLM-L6-v2')
+            query_embedding = embedder.encode([prompt])[0].tolist()
+            
+            # Retrieve relevant chunks from Chroma
+            results = st.session_state.vector_store.query(
+                query_embeddings=[query_embedding],
+                n_results=3
+            )
+            context = "\n\n".join(results['documents'][0])
         
         # Prepare messages for OpenAI
         system_message = {
