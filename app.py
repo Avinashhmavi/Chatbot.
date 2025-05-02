@@ -7,8 +7,8 @@ from docx import Document
 import pandas as pd
 import numpy as np
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.vectorstores import FAISS
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
 from langchain.docstore.document import Document as LangchainDocument
 
 # Initialize session state
@@ -26,19 +26,14 @@ st.set_page_config(page_title="OpenAI RAG Chat Assistant", page_icon="🤖")
 
 # Sidebar configuration
 with st.sidebar:
-    st.title("OpenAI Settings")
-    openai_api_key = st.text_input("Enter OpenAI API Key", type="password", value=st.secrets.get("OPENAI_API_KEY", ""))
-    selected_model = st.selectbox("Choose a Model", ["gpt-4o", "gpt-3.5-turbo"])
-    
-    st.markdown("---")
-    st.markdown("### File Upload Settings")
+    st.title("File Upload")
     uploaded_files = st.file_uploader(
         "Upload files (PDF, Word, CSV, Excel)",
         type=["pdf", "docx", "csv", "xlsx"],
         accept_multiple_files=True
     )
 
-# Function to process uploaded files and create chunks
+# Process uploaded files and create chunks
 def process_files(uploaded_files, chunk_size=1000, chunk_overlap=200):
     all_text = []
     text_splitter = RecursiveCharacterTextSplitter(
@@ -77,7 +72,7 @@ def process_files(uploaded_files, chunk_size=1000, chunk_overlap=200):
 # Function to create vector store
 def create_vector_store(text_chunks, api_key):
     try:
-        embeddings = OpenAIEmbeddings(openai_api_key=api_key)
+        embeddings = OpenAIEmbeddings(api_key=api_key)
         documents = [LangchainDocument(page_content=chunk) for chunk in text_chunks]
         vector_store = FAISS.from_documents(documents, embeddings)
         return vector_store
@@ -88,8 +83,13 @@ def create_vector_store(text_chunks, api_key):
 # Process files when uploaded
 if uploaded_files:
     st.session_state.processed_text = process_files(uploaded_files)
-    if openai_api_key and st.session_state.processed_text:
-        st.session_state.vector_store = create_vector_store(st.session_state.processed_text, openai_api_key)
+    if st.session_state.processed_text:
+        try:
+            openai_api_key = st.secrets["OPENAI_API_KEY"]
+            st.session_state.vector_store = create_vector_store(st.session_state.processed_text, openai_api_key)
+        except KeyError:
+            st.error("OPENAI_API_KEY not found in Streamlit secrets")
+            st.stop()
 
 # Function to retrieve row from CSV/Excel
 def retrieve_row(file_name, row_index):
@@ -116,8 +116,10 @@ for message in st.session_state.messages:
 
 # Chat input and processing
 if prompt := st.chat_input("Ask me anything..."):
-    if not openai_api_key:
-        st.error("Please enter your OpenAI API key in the sidebar or configure it in secrets")
+    try:
+        openai_api_key = st.secrets["OPENAI_API_KEY"]
+    except KeyError:
+        st.error("OPENAI_API_KEY not found in Streamlit secrets")
         st.stop()
     
     # Add user message to chat history
@@ -175,7 +177,7 @@ if prompt := st.chat_input("Ask me anything..."):
         
         # Create chat completion
         response = client.chat.completions.create(
-            model=selected_model,
+            model="gpt-4o",
             messages=messages,
             temperature=0.5,
             max_tokens=7000
