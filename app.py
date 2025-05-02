@@ -95,8 +95,12 @@ if prompt := st.chat_input("Ask me anything..."):
         st.markdown(prompt)
     
     try:
-        # Initialize OpenAI client
-        client = OpenAI(api_key=openai_api_key)
+        # Initialize OpenAI client with minimal configuration
+        client = OpenAI(
+            api_key=openai_api_key,
+            base_url="https://api.openai.com/v1",
+            default_headers={"Content-Type": "application/json"}
+        )
         
         # Check if the prompt is requesting a specific row from CSV/Excel
         if "row" in prompt.lower() and any(ext in prompt.lower() for ext in ["csv", "xlsx"]):
