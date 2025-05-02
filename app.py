@@ -61,7 +61,7 @@ def reset_session():
 
 # Function to truncate context to fit token limit
 def truncate_context(context, messages, relevant_file=None, row_fetch_response="", max_tokens=7000, model="llama-3.3-70b-versatile"):
-    system_prompt = "You are a helpful assistant."
+    system_prompt = "You are a helpful assistant. Answer only based on the provided file content or row fetch results. If the question is unrelated to the files, respond with: 'I can only answer questions related to the uploaded files.'"
     total_tokens = estimate_tokens(system_prompt + context, model)
     
     # Estimate tokens for messages
@@ -180,6 +180,23 @@ def fetch_row(file_name, column_name, column_value):
             return f"Error processing request: {str(e)}"
     return f"No dataframe found for {file_name}"
 
+# Function to check if the prompt is related to uploaded files
+def is_prompt_related_to_files(prompt, processed_text, dataframes):
+    prompt_lower = prompt.lower()
+    # Check for file names or row fetch patterns
+    file_names = [chunk.split('\n')[0].replace("File: ", "").lower() for chunk in processed_text]
+    if any(name in prompt_lower for name in file_names):
+        return True
+    if "fetch row" in prompt_lower or "get row" in prompt_lower:
+        return True
+    # Check for keywords from file content
+    content_keywords = []
+    for chunk in processed_text:
+        words = chunk.lower().split()
+        content_keywords.extend([word for word in words if len(word) > 3])  # Basic keyword extraction
+    # Consider prompt related if it contains at least one content keyword
+    return any(keyword in prompt_lower for keyword in content_keywords[:10])  # Limit to top 10 keywords
+
 # Chat input and processing
 if prompt := st.chat_input("Ask me anything..."):
     # Initialize clients
@@ -197,90 +214,94 @@ if prompt := st.chat_input("Ask me anything..."):
     with st.chat_message("user"):
         st.markdown(prompt)
     
-    # Check for row fetch
-    row_fetch_response = ""
-    relevant_file = None
-    if "fetch row" in prompt.lower() or "get row" in prompt.lower():
-        try:
-            file_match = re.search(r'\b[\w\-]+\.(csv|xlsx)\b', prompt.lower())
-            value_match = re.search(r'\bcust[\w\-]+\b', prompt.lower())
-            column_name = "customer id"
-            
-            if file_match:
-                relevant_file = file_match.group(0)
-            if value_match:
-                column_value = value_match.group(0).upper()
-            
-            if column_value and relevant_file:
-                row_fetch_response = fetch_row(relevant_file, column_name, column_value)
-            elif column_value:
-                for fname in st.session_state.dataframes:
-                    if fname.endswith(('.csv', '.xlsx')):
-                        result = fetch_row(fname, column_name, column_value)
-                        if not result.startswith(("No rows", "Column", "No dataframe", "Error")):
+    # Check if prompt is related to files
+    if not st.session_state.processed_text or not is_prompt_related_to_files(prompt, st.session_state.processed_text, st.session_state.dataframes):
+        ai_response = "I can only answer questions related to the uploaded files."
+        st.session_state.messages.append({"role": "assistant", "content": ai_response})
+        with st.chat_message("assistant"):
+            st.markdown(ai_response)
+    else:
+        # Check for row fetch
+        row_fetch_response = ""
+        relevant_file = None
+        if "fetch row" in prompt.lower() or "get row" in prompt.lower():
+            try:
+                file_match = re.search(r'\b[\w\-]+\.(csv|xlsx)\b', prompt.lower())
+                value_match = re.search(r'\bcust[\w\-]+\b', prompt.lower())
+                column_name = "customer id"
+                
+                if file_match:
+                    relevant_file = file_match.group(0)
+                if value_match:
+                    column_value = value_match.group(0).upper()
+                
+                if column_value and relevant_file:
+                    row_fetch_response = fetch_row(relevant_file, column_name, column_value)
+                elif column_value:
+                    for fname in st.session_state.dataframes:
+                        if fname.endswith(('.csv', '.xlsx')):
+                            result = fetch_row(fname, column_name, column_value)
+                            if not result.startswith(("No rows", "Column", "No dataframe", "Error")):
+                                row_fetch_response = result
+                                relevant_file = fname
+                                break
                             row_fetch_response = result
-                            relevant_file = fname
-                            break
-                        row_fetch_response = result
-            else:
+                else:
+                    row_fetch_response = "Unable to process row fetch request. Please use format: 'fetch row for [column] [value] in [filename]'"
+            except:
                 row_fetch_response = "Unable to process row fetch request. Please use format: 'fetch row for [column] [value] in [filename]'"
-        except:
-            row_fetch_response = "Unable to process row fetch request. Please use format: 'fetch row for [column] [value] in [filename]'"
 
-    # Prepare context
-    context = f"""
-    User Question: {prompt}
-    
-    Uploaded Files Context (chunked, limited to 1 chunk):
-    {'\n\n'.join(st.session_state.processed_text[:1])}
-    
-    Row Fetch Result (if applicable): {row_fetch_response}
-    
-    Please answer based on the provided context, row fetch result (if any), and your general knowledge.
-    """
-    
-    # Truncate context
-    context, messages_to_send = truncate_context(context, st.session_state.messages, relevant_file, row_fetch_response)
-    
-    # Debug token usage
-    total_tokens = estimate_tokens(context + ''.join(m['content'] for m in messages_to_send))
-    st.write(f"Estimated tokens: {total_tokens}")
-    
-    try:
-        # Try Groq first
-        try:
-            response = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "system", "content": "You are a helpful assistant."}] +
-                         [{"role": m["role"], "content": context + m["content"]} 
-                          for m in messages_to_send],
-                temperature=0.5,
-                max_tokens=3000
-            )
-            ai_response = response.choices[0].message.content
+        # Prepare context
+        context = f"""
+        User Question: {prompt}
         
-        except RateLimitError as e:
-            if "429" in str(e):  # Check for rate limit error
-                st.warning("Groq rate limit reached. Switching to OpenAI model (gpt-3.5-turbo).")
-                response = openai_client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=[{"role": "system", "content": "You are a helpful assistant."}] +
+        Uploaded Files Context (chunked, limited to 1 chunk):
+        {'\n\n'.join(st.session_state.processed_text[:1])}
+        
+        Row Fetch Result (if applicable): {row_fetch_response}
+        """
+        
+        # Truncate context
+        context, messages_to_send = truncate_context(context, st.session_state.messages, relevant_file, row_fetch_response)
+        
+        # Debug token usage
+        total_tokens = estimate_tokens(context + ''.join(m['content'] for m in messages_to_send))
+        st.write(f"Estimated tokens: {total_tokens}")
+        
+        try:
+            # Try Groq first
+            try:
+                response = groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[{"role": "system", "content": "You are a helpful assistant. Answer only based on the provided file content or row fetch results. If the question is unrelated to the files, respond with: 'I can only answer questions related to the uploaded files.'"}] +
                              [{"role": m["role"], "content": context + m["content"]} 
                               for m in messages_to_send],
                     temperature=0.5,
                     max_tokens=3000
                 )
                 ai_response = response.choices[0].message.content
-            else:
-                raise e
+            
+            except RateLimitError as e:
+                if "429" in str(e):  # Check for rate limit error
+                    st.warning("Groq rate limit reached. Switching to OpenAI model (gpt-3.5-turbo).")
+                    response = openai_client.chat.completions.create(
+                        model="gpt-3.5-turbo",
+                        messages=[{"role": "system", "content": "You are a helpful assistant. Answer only based on the provided file content or row fetch results. If the question is unrelated to the files, respond with: 'I can only answer questions related to the uploaded files.'"}] +
+                                 [{"role": m["role"], "content": context + m["content"]} 
+                                  for m in messages_to_send],
+                        temperature=0.5,
+                        max_tokens=3000
+                    )
+                    ai_response = response.choices[0].message.content
+                else:
+                    raise e
+            
+            # Add AI response to chat history
+            st.session_state.messages.append({"role": "assistant", "content": ai_response})
+            
+            # Display AI response
+            with st.chat_message("assistant"):
+                st.markdown(ai_response)
         
-        # Add AI response to chat history
-        st.session_state.messages.append({"role": "assistant", "content": ai_response})
-        
-        # Display AI response
-        with st.chat_message("assistant"):
-            st.markdown(ai_response)
-    
-    except Exception as e:
-        st.error(f"Error: {str(e)}")
-        
+        except Exception as e:
+            st.error(f"Error: {str(e)}")
