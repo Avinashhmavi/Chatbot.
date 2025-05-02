@@ -160,7 +160,7 @@ if prompt := st.chat_input("Ask me anything..."):
                      [{"role": m["role"], "content": context + m["content"]} 
                       for m in st.session_state.messages],
             temperature=0.5,
-            max_tokens=50000
+            max_tokens=10000
         )
         
         # Get AI response
