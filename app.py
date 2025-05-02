@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import tempfile
 from groq import Groq, RateLimitError
+from openai import OpenAI
 from PyPDF2 import PdfReader
 from docx import Document
 import pandas as pd
@@ -39,13 +40,13 @@ with st.sidebar:
         st.session_state.uploaded_files = uploaded_files
 
 # Function to chunk large text
-def chunk_text(text, max_chunk_size=3000):  # Further reduced chunk size
+def chunk_text(text, max_chunk_size=3000):
     chunks = []
     for i in range(0, len(text), max_chunk_size):
         chunks.append(text[i:i + max_chunk_size])
     return chunks
 
-# Function to estimate tokens (more conservative)
+# Function to estimate tokens (compatible with Groq and OpenAI)
 def estimate_tokens(text, model="llama-3.3-70b-versatile"):
     # Conservative estimate: 2 characters per token
     return len(text) // 2 + 100  # Add padding for safety
@@ -90,7 +91,7 @@ def truncate_context(context, messages, relevant_file=None, row_fetch_response="
         User Question: {messages[-1]["content"] if messages else ""}
         
         Uploaded Files Context (chunked, limited to 1 chunk):
-        {'\n\n'.join(processed_text[:1])}  # Limit to 1 chunk
+        {'\n\n'.join(processed_text[:1])}
         
         Row Fetch Result (if applicable): {row_fetch_response}
         """
@@ -107,7 +108,7 @@ def truncate_context(context, messages, relevant_file=None, row_fetch_response="
 def process_files(uploaded_files):
     all_text_chunks = []
     dataframes = {}
-    max_chunks_per_file = 1  # Reduced to 1 chunk per file
+    max_chunks_per_file = 1
     
     for file in uploaded_files:
         file_type = file.name.split(".")[-1]
@@ -134,7 +135,7 @@ def process_files(uploaded_files):
                 
                 dataframes[file_name] = df
                 
-                text = df.head(10).to_string()  # Limit to first 10 rows
+                text = df.head(10).to_string()
                 chunks = chunk_text(text)[:max_chunks_per_file]
                 all_text_chunks.extend([f"File: {file_name}\n{chunk}" for chunk in chunks])
                 
@@ -155,7 +156,7 @@ if uploaded_files:
 
 # Main chat interface
 st.title("💬 Chat Assistant")
-st.caption("🚀 A chatbot powered by Groq")
+st.caption("🚀 A chatbot powered by Groq with OpenAI fallback")
 
 # Display chat messages
 for message in st.session_state.messages:
@@ -181,11 +182,12 @@ def fetch_row(file_name, column_name, column_value):
 
 # Chat input and processing
 if prompt := st.chat_input("Ask me anything..."):
-    # Initialize Groq client
+    # Initialize clients
     try:
-        client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+        groq_client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+        openai_client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
     except Exception as e:
-        st.error("Error initializing Groq client. Please check your API key in secrets.")
+        st.error("Error initializing API clients. Please check your API keys in secrets.")
         st.stop()
 
     # Add user message to chat history
@@ -200,10 +202,9 @@ if prompt := st.chat_input("Ask me anything..."):
     relevant_file = None
     if "fetch row" in prompt.lower() or "get row" in prompt.lower():
         try:
-            # Extract file name and column value using regex
             file_match = re.search(r'\b[\w\-]+\.(csv|xlsx)\b', prompt.lower())
             value_match = re.search(r'\bcust[\w\-]+\b', prompt.lower())
-            column_name = "customer id"  # Default column name
+            column_name = "customer id"
             
             if file_match:
                 relevant_file = file_match.group(0)
@@ -246,29 +247,32 @@ if prompt := st.chat_input("Ask me anything..."):
     st.write(f"Estimated tokens: {total_tokens}")
     
     try:
-        # Create chat completion with retry
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
+        # Try Groq first
+        try:
+            response = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "system", "content": "You are a helpful assistant."}] +
+                         [{"role": m["role"], "content": context + m["content"]} 
+                          for m in messages_to_send],
+                temperature=0.5,
+                max_tokens=3000
+            )
+            ai_response = response.choices[0].message.content
+        
+        except RateLimitError as e:
+            if "429" in str(e):  # Check for rate limit error
+                st.warning("Groq rate limit reached. Switching to OpenAI model (gpt-3.5-turbo).")
+                response = openai_client.chat.completions.create(
+                    model="gpt-3.5-turbo",
                     messages=[{"role": "system", "content": "You are a helpful assistant."}] +
                              [{"role": m["role"], "content": context + m["content"]} 
                               for m in messages_to_send],
                     temperature=0.5,
-                    max_tokens=3000  # Further reduced to reserve tokens
+                    max_tokens=3000
                 )
-                break
-            except RateLimitError as e:
-                if attempt < max_retries - 1:
-                    wait_time = min(2 ** attempt, 8)  # Cap wait time at 8 seconds
-                    st.warning(f"Groq rate limit hit, retrying in {wait_time} seconds...")
-                    time.sleep(wait_time)
-                else:
-                    raise e
-    
-        # Get AI response
-        ai_response = response.choices[0].message.content
+                ai_response = response.choices[0].message.content
+            else:
+                raise e
         
         # Add AI response to chat history
         st.session_state.messages.append({"role": "assistant", "content": ai_response})
@@ -279,3 +283,4 @@ if prompt := st.chat_input("Ask me anything..."):
     
     except Exception as e:
         st.error(f"Error: {str(e)}")
+        
