@@ -7,9 +7,7 @@ from docx import Document
 import pandas as pd
 import time
 
-# Initialize session state
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# Initialize session state for processed files only
 if "processed_text" not in st.session_state:
     st.session_state.processed_text = []
 if "dataframes" not in st.session_state:
@@ -47,17 +45,13 @@ def estimate_tokens(text, model="llama-3.3-70b-versatile"):
     return len(text) // 3
 
 # Function to truncate context to fit token limit
-def truncate_context(context, messages, relevant_file=None, max_tokens=5000, model="llama-3.3-70b-versatile"):
+def truncate_context(context, relevant_file=None, max_tokens=5000, model="llama-3.3-70b-versatile"):
     system_prompt = "You are a helpful assistant."
     total_tokens = estimate_tokens(system_prompt + context, model)
     
-    # Estimate tokens for messages
-    message_tokens = sum(estimate_tokens(m["content"], model) for m in messages)
-    total_tokens += message_tokens
-    
     # If within limit, return as is
     if total_tokens <= max_tokens:
-        return context, messages
+        return context
     
     # Prioritize chunks from relevant file
     processed_text = st.session_state.processed_text.copy()
@@ -70,21 +64,16 @@ def truncate_context(context, messages, relevant_file=None, max_tokens=5000, mod
     while processed_text and total_tokens > max_tokens:
         processed_text.pop()
         context = f"""
-        User Question: {messages[-1]["content"]}
+        User Question: {prompt}
         
         Uploaded Files Context (chunked):
         {'\n\n'.join(processed_text[:3])}  # Limit to 3 chunks
         
         Row Fetch Result (if applicable): {row_fetch_response}
         """
-        total_tokens = estimate_tokens(system_prompt + context, model) + message_tokens
+        total_tokens = estimate_tokens(system_prompt + context, model)
     
-    # Keep only the last 2 messages
-    truncated_messages = messages[-2:] if len(messages) > 2 else messages
-    message_tokens = sum(estimate_tokens(m["content"], model) for m in truncated_messages)
-    total_tokens = estimate_tokens(system_prompt + context, model) + message_tokens
-    
-    return context, truncated_messages
+    return context
 
 # Process uploaded files
 def process_files(uploaded_files):
@@ -134,16 +123,11 @@ if uploaded_files:
     st.session_state.processed_text, st.session_state.dataframes = process_files(uploaded_files)
     total_tokens = sum(estimate_tokens(chunk) for chunk in st.session_state.processed_text)
     if total_tokens > 4000:
-        st.warning("Uploaded files may exceed Groq's rate limits on the free tier. Consider smaller files or a paid plan.")
+        st.warning("Uploaded files may exceed Groq's rate limits. Consider smaller files or a paid plan.")
 
 # Main chat interface
 st.title("💬 Chat Assistant")
 st.caption("🚀 A chatbot powered by Groq")
-
-# Display chat messages
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
 
 # Function to fetch row from dataframe based on column value
 def fetch_row(file_name, column_name, column_value):
@@ -171,9 +155,6 @@ if prompt := st.chat_input("Ask me anything..."):
         st.error("Error initializing Groq client. Please check your API key in secrets.")
         st.stop()
 
-    # Add user message to chat history
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    
     # Display user message
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -226,10 +207,10 @@ if prompt := st.chat_input("Ask me anything..."):
     """
     
     # Truncate context
-    context, messages_to_send = truncate_context(context, st.session_state.messages, relevant_file)
+    context = truncate_context(context, relevant_file)
     
     # Debug token usage
-    st.write(f"Estimated tokens: {estimate_tokens(context + ''.join(m['content'] for m in messages_to_send))}")
+    st.write(f"Estimated tokens: {estimate_tokens(context)}")
     
     try:
         # Create chat completion with retry
@@ -238,9 +219,10 @@ if prompt := st.chat_input("Ask me anything..."):
             try:
                 response = client.chat.completions.create(
                     model="llama-3.3-70b-versatile",
-                    messages=[{"role": "system", "content": "You are a helpful assistant."}] +
-                             [{"role": m["role"], "content": context + m["content"]} 
-                              for m in messages_to_send],
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": context}
+                    ],
                     temperature=0.5,
                     max_tokens=32768
                 )
@@ -255,9 +237,6 @@ if prompt := st.chat_input("Ask me anything..."):
     
         # Get AI response
         ai_response = response.choices[0].message.content
-        
-        # Add AI response to chat history
-        st.session_state.messages.append({"role": "assistant", "content": ai_response})
         
         # Display AI response
         with st.chat_message("assistant"):
