@@ -48,11 +48,11 @@ def estimate_tokens(text, model="gpt-4o"):
         encoding = tiktoken.encoding_for_model(model)
         return len(encoding.encode(text))
     except Exception:
-        # Fallback: rough estimate of 4 characters per token
-        return len(text) // 4
+        # Fallback: conservative estimate of 3 characters per token
+        return len(text) // 3
 
 # Function to truncate context to fit token limit
-def truncate_context(context, messages, max_tokens=25000, model="gpt-4o"):
+def truncate_context(context, messages, max_tokens=20000, model="gpt-4o"):
     system_prompt = "You are a helpful assistant."
     total_tokens = estimate_tokens(system_prompt + context, model)
     
@@ -216,7 +216,7 @@ if prompt := st.chat_input("Ask me anything..."):
                      [{"role": m["role"], "content": context + m["content"]} 
                       for m in messages_to_send],
             temperature=0.5,
-            max_tokens=7000
+            max_tokens=5000  # Reduced to reserve space for response
         )
         
         # Get AI response
