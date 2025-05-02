@@ -7,9 +7,9 @@ from docx import Document
 import pandas as pd
 import numpy as np
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from sentence_transformers import SentenceTransformer
-import chromadb
+from langchain_community.vectorstores import FAISS
 from langchain.docstore.document import Document as LangchainDocument
+from sentence_transformers import SentenceTransformer
 
 # Initialize session state
 if "messages" not in st.session_state:
@@ -20,6 +20,8 @@ if "vector_store" not in st.session_state:
     st.session_state.vector_store = None
 if "file_dataframes" not in st.session_state:
     st.session_state.file_dataframes = {}
+if "embedder" not in st.session_state:
+    st.session_state.embedder = None
 
 # Streamlit app configuration
 st.set_page_config(page_title="RAG Chat Assistant", page_icon="🤖")
@@ -64,31 +66,29 @@ def process_files(uploaded_files, chunk_size=1000, chunk_overlap=200):
             chunks = text_splitter.split_text(text)
             all_text.extend([f"File: {file_name}\n{chunk}" for chunk in chunks])
         
-        except Exception as e:
+        except Exception敢于e:
             all_text.append(f"Error processing {file_name}: {str(e)}")
     
     return all_text
 
+# Custom embedding function for FAISS
+def sentence_transformer_embedding(texts):
+    if not st.session_state.embedder:
+        st.session_state.embedder = SentenceTransformer('all-MiniLM-L6-v2')
+    return st.session_state.embedder.encode(texts, convert_to_tensor=False).tolist()
+
 # Function to create vector store
 def create_vector_store(text_chunks):
     try:
-        # Initialize Sentence Transformer model
-        embedder = SentenceTransformer('all-MiniLM-L6-v2')
+        # Create LangChain documents
+        documents = [LangchainDocument(page_content=chunk) for chunk in text_chunks]
         
-        # Create Chroma client
-        chroma_client = chromadb.Client()
-        collection = chroma_client.create_collection(name="documents")
-        
-        # Generate embeddings and add to Chroma
-        embeddings = embedder.encode(text_chunks)
-        for i, (chunk, embedding) in enumerate(zip(text_chunks, embeddings)):
-            collection.add(
-                documents=[chunk],
-                embeddings=[embedding.tolist()],
-                ids=[f"doc_{i}"]
-            )
-        
-        return collection
+        # Create FAISS vector store with custom embedding function
+        vector_store = FAISS.from_documents(
+            documents,
+            embedding_function=sentence_transformer_embedding
+        )
+        return vector_store
     except Exception as e:
         st.error(f"Error creating vector store: {str(e)}")
         return None
@@ -163,16 +163,9 @@ if prompt := st.chat_input("Ask me anything..."):
         # RAG implementation
         context = ""
         if st.session_state.vector_store:
-            # Initialize Sentence Transformer for query embedding
-            embedder = SentenceTransformer('all-MiniLM-L6-v2')
-            query_embedding = embedder.encode([prompt])[0].tolist()
-            
-            # Retrieve relevant chunks from Chroma
-            results = st.session_state.vector_store.query(
-                query_embeddings=[query_embedding],
-                n_results=3
-            )
-            context = "\n\n".join(results['documents'][0])
+            # Retrieve relevant chunks
+            docs = st.session_state.vector_store.similarity_search(prompt, k=3)
+            context = "\n\n".join([doc.page_content for doc in docs])
         
         # Prepare messages for OpenAI
         system_message = {
