@@ -6,6 +6,7 @@ from PyPDF2 import PdfReader
 from docx import Document
 import pandas as pd
 import time
+import re
 
 # Initialize session state
 if "messages" not in st.session_state:
@@ -35,24 +36,24 @@ with st.sidebar:
         st.session_state.uploaded_files = uploaded_files
 
 # Function to chunk large text
-def chunk_text(text, max_chunk_size=10000):
+def chunk_text(text, max_chunk_size=5000):  # Reduced chunk size
     chunks = []
     for i in range(0, len(text), max_chunk_size):
         chunks.append(text[i:i + max_chunk_size])
     return chunks
 
-# Function to estimate tokens (fallback for Groq models)
+# Function to estimate tokens (more conservative)
 def estimate_tokens(text, model="llama-3.3-70b-versatile"):
-    # Conservative estimate: 3 characters per token
-    return len(text) // 3
+    # Conservative estimate: 2 characters per token
+    return len(text) // 2 + 100  # Add padding for safety
 
 # Function to truncate context to fit token limit
-def truncate_context(context, messages, relevant_file=None, max_tokens=5000, model="llama-3.3-70b-versatile"):
+def truncate_context(context, messages, relevant_file=None, max_tokens=8000, model="llama-3.3-70b-versatile"):
     system_prompt = "You are a helpful assistant."
     total_tokens = estimate_tokens(system_prompt + context, model)
     
     # Estimate tokens for messages
-    message_tokens = sum(estimate_tokens(m["content"], model) for m in messages)
+    message_tokens = sum(estimateFENew(estimate_tokens(m["content"], model) for m in messages)
     total_tokens += message_tokens
     
     # If within limit, return as is
@@ -66,21 +67,21 @@ def truncate_context(context, messages, relevant_file=None, max_tokens=5000, mod
         other_chunks = [chunk for chunk in processed_text if relevant_file not in chunk]
         processed_text = prioritized_chunks + other_chunks
     
-    # Truncate processed_text chunks
+    # Truncate processed_text chunks aggressively
     while processed_text and total_tokens > max_tokens:
         processed_text.pop()
         context = f"""
         User Question: {messages[-1]["content"]}
         
-        Uploaded Files Context (chunked):
-        {'\n\n'.join(processed_text[:3])}  # Limit to 3 chunks
+        Uploaded Files Context (chunked, limited to 2 chunks):
+        {'\n\n'.join(processed_text[:2])}  # Limit to 2 chunks
         
         Row Fetch Result (if applicable): {row_fetch_response}
         """
         total_tokens = estimate_tokens(system_prompt + context, model) + message_tokens
     
-    # Keep only the last 2 messages
-    truncated_messages = messages[-2:] if len(messages) > 2 else messages
+    # Keep only the last message
+    truncated_messages = [messages[-1]] if messages else []
     message_tokens = sum(estimate_tokens(m["content"], model) for m in truncated_messages)
     total_tokens = estimate_tokens(system_prompt + context, model) + message_tokens
     
@@ -90,7 +91,7 @@ def truncate_context(context, messages, relevant_file=None, max_tokens=5000, mod
 def process_files(uploaded_files):
     all_text_chunks = []
     dataframes = {}
-    max_chunks_per_file = 3  # Limit chunks per file
+    max_chunks_per_file = 2  # Reduced to 2 chunks per file
     
     for file in uploaded_files:
         file_type = file.name.split(".")[-1]
@@ -99,7 +100,7 @@ def process_files(uploaded_files):
         try:
             if file_type == "pdf":
                 reader = PdfReader(file)
-                text = "".join([page.extract_text() for page in reader.pages])
+                text = "".join([page.extract_text() or "" for page in reader.pages])
                 chunks = chunk_text(text)[:max_chunks_per_file]
                 all_text_chunks.extend([f"File: {file_name}\n{chunk}" for chunk in chunks])
                 
@@ -117,7 +118,7 @@ def process_files(uploaded_files):
                 
                 dataframes[file_name] = df
                 
-                text = df.head(30).to_string()  # Limit to first 30 rows
+                text = df.head(20).to_string()  # Limit to first 20 rows
                 chunks = chunk_text(text)[:max_chunks_per_file]
                 all_text_chunks.extend([f"File: {file_name}\n{chunk}" for chunk in chunks])
                 
@@ -133,8 +134,8 @@ def process_files(uploaded_files):
 if uploaded_files:
     st.session_state.processed_text, st.session_state.dataframes = process_files(uploaded_files)
     total_tokens = sum(estimate_tokens(chunk) for chunk in st.session_state.processed_text)
-    if total_tokens > 4000:
-        st.warning("Uploaded files may exceed Groq's rate limits on the free tier. Consider smaller files or a paid plan.")
+    if total_tokens > 6000:
+        st.warning("Uploaded files may exceed Groq's token limits (12,000 TPM). Consider uploading smaller files or upgrading to a paid plan at https://console.groq.com/settings/billing.")
 
 # Main chat interface
 st.title("💬 Chat Assistant")
@@ -183,26 +184,22 @@ if prompt := st.chat_input("Ask me anything..."):
     relevant_file = None
     if "fetch row" in prompt.lower() or "get row" in prompt.lower():
         try:
-            words = prompt.lower().split()
-            column_value = None
-            column_name = None
-            file_name = None
+            # Extract file name and column value using regex
+            file_match = re.search(r'\b[\w\-]+\.(csv|xlsx)\b', prompt.lower())
+            value_match = re.search(r'\bcust[\w\-]+\b', prompt.lower())
+            column_name = "customer id"  # Default column name
             
-            for i, word in enumerate(words):
-                if word.startswith("cust") and word.isalnum():
-                    column_value = word.upper()
-                elif any(word.endswith(ext) for ext in ['.csv', '.xlsx']):
-                    file_name = word
-                elif "id" in word:
-                    column_name = "customer id"
+            if file_match:
+                relevant_file = file_match.group(0)
+            if value_match:
+                column_value = value_match.group(0).upper()
             
-            if column_value and file_name:
-                relevant_file = file_name
-                row_fetch_response = fetch_row(file_name, column_name or "customer id", column_value)
+            if column_value and relevant_file:
+                row_fetch_response = fetch_row(relevant_file, column_name, column_value)
             elif column_value:
                 for fname in st.session_state.dataframes:
                     if fname.endswith(('.csv', '.xlsx')):
-                        result = fetch_row(fname, column_name or "customer id", column_value)
+                        result = fetch_row(fname, column_name, column_value)
                         if not result.startswith(("No rows", "Column", "No dataframe", "Error")):
                             row_fetch_response = result
                             relevant_file = fname
@@ -217,8 +214,8 @@ if prompt := st.chat_input("Ask me anything..."):
     context = f"""
     User Question: {prompt}
     
-    Uploaded Files Context (chunked):
-    {'\n\n'.join(st.session_state.processed_text)}
+    Uploaded Files Context (chunked, limited to 2 chunks):
+    {'\n\n'.join(st.session_state.processed_text[:2])}
     
     Row Fetch Result (if applicable): {row_fetch_response}
     
@@ -229,7 +226,10 @@ if prompt := st.chat_input("Ask me anything..."):
     context, messages_to_send = truncate_context(context, st.session_state.messages, relevant_file)
     
     # Debug token usage
-    st.write(f"Estimated tokens: {estimate_tokens(context + ''.join(m['content'] for m in messages_to_send))}")
+    total_tokens = estimate_tokens(context + ''.join(m['content'] for m in messages_to_send))
+    st.write(f"Estimated tokens: {total_tokens}")
+    if total_tokens > 10000:
+        st.warning("Token usage is close to the limit. Response may be truncated.")
     
     try:
         # Create chat completion with retry
@@ -242,12 +242,12 @@ if prompt := st.chat_input("Ask me anything..."):
                              [{"role": m["role"], "content": context + m["content"]} 
                               for m in messages_to_send],
                     temperature=0.5,
-                    max_tokens=32768
+                    max_tokens=4000  # Reduced to reserve tokens
                 )
                 break
             except RateLimitError as e:
                 if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt
+                    wait_time = min(2 ** attempt, 8)  # Cap wait time at 8 seconds
                     st.warning(f"Groq rate limit hit, retrying in {wait_time} seconds...")
                     time.sleep(wait_time)
                 else:
