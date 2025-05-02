@@ -19,6 +19,8 @@ if "dataframes" not in st.session_state:
     st.session_state.dataframes = {}
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
+if "file_keywords" not in st.session_state:
+    st.session_state.file_keywords = []
 
 # Streamlit app configuration
 st.set_page_config(page_title="Chat Assistant", page_icon="🤖")
@@ -56,12 +58,13 @@ def reset_session():
     st.session_state.messages = []
     st.session_state.processed_text = []
     st.session_state.dataframes = {}
+    st.session_state.file_keywords = []
     st.session_state.session_id = str(uuid.uuid4())
     st.warning("Chat session has been reset due to approaching token limit. Starting fresh.")
 
 # Function to truncate context to fit token limit
 def truncate_context(context, messages, relevant_file=None, row_fetch_response="", max_tokens=7000, model="llama-3.3-70b-versatile"):
-    system_prompt = "You are a helpful assistant. Answer strictly based on the provided file content or row fetch results. Do not use any general knowledge or external information. If the question is unrelated to the files, respond with: 'I can only answer questions related to the uploaded files.'"
+    system_prompt = "You are a helpful assistant. Answer only based on the provided file content or row fetch results."
     total_tokens = estimate_tokens(system_prompt + context, model)
     
     # Estimate tokens for messages
@@ -104,11 +107,21 @@ def truncate_context(context, messages, relevant_file=None, row_fetch_response="
     
     return context, truncated_messages
 
+# Function to extract keywords from file content
+def extract_file_keywords(processed_text, file_names):
+    keywords = set(file_names)  # Include file names as keywords
+    for chunk in processed_text:
+        # Extract words with 5+ characters, excluding common words
+        words = re.findall(r'\b\w{5,}\b', chunk.lower())
+        keywords.update([word for word in words if word not in ['the', 'and', 'for', 'with', 'this', 'that', 'from', 'have']])
+    return list(keywords)[:10]  # Limit to top 10 unique keywords
+
 # Process uploaded files
 def process_files(uploaded_files):
     all_text_chunks = []
     dataframes = {}
     max_chunks_per_file = 1
+    file_names = [file.name for file in uploaded_files]
     
     for file in uploaded_files:
         file_type = file.name.split(".")[-1]
@@ -145,11 +158,13 @@ def process_files(uploaded_files):
         except Exception as e:
             all_text_chunks.append(f"Error processing {file_name}: {str(e)}")
     
-    return all_text_chunks, dataframes
+    # Extract keywords after processing files
+    file_keywords = extract_file_keywords(all_text_chunks, file_names)
+    return all_text_chunks, dataframes, file_keywords
 
 # Process files when uploaded
 if uploaded_files:
-    st.session_state.processed_text, st.session_state.dataframes = process_files(uploaded_files)
+    st.session_state.processed_text, st.session_state.dataframes, st.session_state.file_keywords = process_files(uploaded_files)
     total_tokens = sum(estimate_tokens(chunk) for chunk in st.session_state.processed_text)
     if total_tokens > 5000:
         st.warning("Uploaded files may exceed Groq's token limits (12,000 TPM). Consider uploading smaller files or upgrading to a paid plan at https://console.groq.com/settings/billing.")
@@ -181,28 +196,17 @@ def fetch_row(file_name, column_name, column_value):
     return f"No dataframe found for {file_name}"
 
 # Function to check if the prompt is related to uploaded files
-def is_prompt_related_to_files(prompt, processed_text, dataframes):
-    if not processed_text:  # No files uploaded
+def is_prompt_related_to_files(prompt, file_keywords):
+    if not file_keywords:  # No files uploaded
         return False
     
     prompt_lower = prompt.lower()
-    # Check for explicit file names
-    file_names = [chunk.split('\n')[0].replace("File: ", "").lower() for chunk in processed_text]
-    if any(name in prompt_lower for name in file_names):
-        return True
-    
     # Check for row fetch commands
     if "fetch row" in prompt_lower or "get row" in prompt_lower:
         return True
     
-    # Extract specific keywords from file content (avoid common words)
-    content_keywords = []
-    for chunk in processed_text:
-        words = re.findall(r'\b\w{5,}\b', chunk.lower())  # Words with 5+ characters
-        content_keywords.extend([word for word in words if word not in ['the', 'and', 'for', 'with', 'this']])  # Exclude common words
-    
-    # Prompt is related only if it contains a specific keyword from the file
-    return any(keyword in prompt_lower for keyword in content_keywords[:5])  # Limit to top 5 unique keywords
+    # Check if prompt contains any file-related keywords
+    return any(keyword.lower() in prompt_lower for keyword in file_keywords)
 
 # Chat input and processing
 if prompt := st.chat_input("Ask me anything..."):
@@ -214,7 +218,7 @@ if prompt := st.chat_input("Ask me anything..."):
         st.markdown(prompt)
     
     # Check if prompt is related to files
-    if not is_prompt_related_to_files(prompt, st.session_state.processed_text, st.session_state.dataframes):
+    if not is_prompt_related_to_files(prompt, st.session_state.file_keywords):
         ai_response = "I can only answer questions related to the uploaded files."
         st.session_state.messages.append({"role": "assistant", "content": ai_response})
         with st.chat_message("assistant"):
@@ -280,10 +284,10 @@ if prompt := st.chat_input("Ask me anything..."):
             try:
                 response = groq_client.chat.completions.create(
                     model="llama-3.3-70b-versatile",
-                    messages=[{"role": "system", "content": "You are a helpful assistant. Answer strictly based on the provided file content or row fetch results. Do not use any general knowledge or external information. If the question is unrelated to the files, respond with: 'I can only answer questions related to the uploaded files.'"}] +
+                    messages=[{"role": "system", "content": "You are a helpful assistant. Answer only based on the provided file content or row fetch results."}] +
                              [{"role": m["role"], "content": context + m["content"]} 
                               for m in messages_to_send],
-                    -                    temperature=0.5,
+                    temperature=0.5,
                     max_tokens=3000
                 )
                 ai_response = response.choices[0].message.content
@@ -293,7 +297,7 @@ if prompt := st.chat_input("Ask me anything..."):
                     st.warning("Groq rate limit reached. Switching to OpenAI model (gpt-3.5-turbo).")
                     response = openai_client.chat.completions.create(
                         model="gpt-3.5-turbo",
-                        messages=[{"role": "system", "content": "You are a helpful assistant. Answer strictly based on the provided file content or row fetch results. Do not use any general knowledge or external information. If the question is unrelated to the files, respond with: 'I can only answer questions related to the uploaded files.'"}] +
+                        messages=[{"role": "system", "content": "You are a helpful assistant. Answer only based on the provided file content or row fetch results."}] +
                                  [{"role": m["role"], "content": context + m["content"]} 
                                   for m in messages_to_send],
                         temperature=0.5,
