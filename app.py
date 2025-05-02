@@ -1,30 +1,19 @@
 import streamlit as st
-import os
-import tempfile
 from openai import OpenAI
 from PyPDF2 import PdfReader
 from docx import Document
 import pandas as pd
-import numpy as np
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain.docstore.document import Document as LangchainDocument
-from sentence_transformers import SentenceTransformer
 
 # Initialize session state
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "processed_text" not in st.session_state:
     st.session_state.processed_text = ""
-if "vector_store" not in st.session_state:
-    st.session_state.vector_store = None
 if "file_dataframes" not in st.session_state:
     st.session_state.file_dataframes = {}
-if "embedder" not in st.session_state:
-    st.session_state.embedder = None
 
 # Streamlit app configuration
-st.set_page_config(page_title="RAG Chat Assistant", page_icon="🤖")
+st.set_page_config(page_title="Chat Assistant", page_icon="🤖")
 
 # Sidebar configuration
 with st.sidebar:
@@ -35,15 +24,9 @@ with st.sidebar:
         accept_multiple_files=True
     )
 
-# Process uploaded files and create chunks
-def process_files(uploaded_files, chunk_size=1000, chunk_overlap=200):
-    all_text = []
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        length_function=len
-    )
-    
+# Process uploaded files
+def process_files(uploaded_files):
+    all_text = ""
     for file in uploaded_files:
         file_type = file.name.split(".")[-1]
         file_name = file.name
@@ -62,42 +45,16 @@ def process_files(uploaded_files, chunk_size=1000, chunk_overlap=200):
             else:
                 text = f"Unsupported file type: {file_type}"
             
-            # Split text into chunks
-            chunks = text_splitter.split_text(text)
-            all_text.extend([f"File: {file_name}\n{chunk}" for chunk in chunks])
+            all_text += f"\n\nFile: {file_name}\n{text}"
         
-        except Exception敢于e:
-            all_text.append(f"Error processing {file_name}: {str(e)}")
+        except Exception as e:
+            all_text += f"\n\nError processing {file_name}: {str(e)}"
     
     return all_text
-
-# Custom embedding function for FAISS
-def sentence_transformer_embedding(texts):
-    if not st.session_state.embedder:
-        st.session_state.embedder = SentenceTransformer('all-MiniLM-L6-v2')
-    return st.session_state.embedder.encode(texts, convert_to_tensor=False).tolist()
-
-# Function to create vector store
-def create_vector_store(text_chunks):
-    try:
-        # Create LangChain documents
-        documents = [LangchainDocument(page_content=chunk) for chunk in text_chunks]
-        
-        # Create FAISS vector store with custom embedding function
-        vector_store = FAISS.from_documents(
-            documents,
-            embedding_function=sentence_transformer_embedding
-        )
-        return vector_store
-    except Exception as e:
-        st.error(f"Error creating vector store: {str(e)}")
-        return None
 
 # Process files when uploaded
 if uploaded_files:
     st.session_state.processed_text = process_files(uploaded_files)
-    if st.session_state.processed_text:
-        st.session_state.vector_store = create_vector_store(st.session_state.processed_text)
 
 # Function to retrieve row from CSV/Excel
 def retrieve_row(file_name, row_index):
@@ -114,8 +71,8 @@ def retrieve_row(file_name, row_index):
     return f"No data found for file: {file_name}"
 
 # Main chat interface
-st.title("💬 RAG Chat Assistant")
-st.caption("🚀 A chatbot powered by OpenAI with RAG capabilities")
+st.title("💬 Chat Assistant")
+st.caption("🚀 A chatbot powered by OpenAI")
 
 # Display chat messages
 for message in st.session_state.messages:
@@ -160,27 +117,26 @@ if prompt := st.chat_input("Ask me anything..."):
                     st.markdown(row_data)
                 st.stop()
         
-        # RAG implementation
-        context = ""
-        if st.session_state.vector_store:
-            # Retrieve relevant chunks
-            docs = st.session_state.vector_store.similarity_search(prompt, k=3)
-            context = "\n\n".join([doc.page_content for doc in docs])
+        # Prepare context with file content and chat history
+        context = f"""
+        Uploaded Files Content:
+        {st.session_state.processed_text}
+        
+        Chat History:
+        {chr(10).join([f"{m['role']}: {m['content']}" for m in st.session_state.messages[:-1]])}
+        
+        Current Question: {prompt}
+        
+        Answer the question based on the provided file content and chat history. If the information is not available, use your general knowledge.
+        """
         
         # Prepare messages for OpenAI
-        system_message = {
-            "role": "system",
-            "content": f"""
-            You are a helpful RAG-based assistant. Answer the user's question based on the following context from uploaded files:
-            {context}
-            
-            If the context doesn't contain relevant information, use your general knowledge to provide a helpful response.
-            """
-        }
-        
-        messages = [system_message] + [
-            {"role": m["role"], "content": m["content"]} 
-            for m in st.session_state.messages
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant. Use the provided context to answer the user's question accurately."
+            },
+            {"role": "user", "content": context}
         ]
         
         # Create chat completion
