@@ -52,7 +52,7 @@ def estimate_tokens(text, model="gpt-4o"):
         return len(text) // 3
 
 # Function to truncate context to fit token limit
-def truncate_context(context, messages, max_tokens=20000, model="gpt-4o"):
+def truncate_context(context, messages, relevant_file=None, max_tokens=15000, model="gpt-4o"):
     system_prompt = "You are a helpful assistant."
     total_tokens = estimate_tokens(system_prompt + context, model)
     
@@ -64,8 +64,14 @@ def truncate_context(context, messages, max_tokens=20000, model="gpt-4o"):
     if total_tokens <= max_tokens:
         return context, messages
     
-    # Truncate processed_text chunks first
+    # Prioritize chunks from relevant file (if specified)
     processed_text = st.session_state.processed_text
+    if relevant_file:
+        prioritized_chunks = [chunk for chunk in processed_text if relevant_file in chunk]
+        other_chunks = [chunk for chunk in processed_text if relevant_file not in chunk]
+        processed_text = prioritized_chunks + other_chunks
+    
+    # Truncate processed_text chunks
     while processed_text and total_tokens > max_tokens:
         processed_text.pop()
         context = f"""
@@ -144,18 +150,22 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# Function to fetch row from dataframe
-def fetch_row(file_name, row_index):
+# Function to fetch row from dataframe based on column value
+def fetch_row(file_name, column_name, column_value):
     if file_name in st.session_state.dataframes:
         df = st.session_state.dataframes[file_name]
         try:
-            row_index = int(row_index)
-            if 0 <= row_index < len(df):
-                return df.iloc[row_index].to_string()
+            # Search for rows where the column matches the value
+            if column_name in df.columns:
+                result = df[df[column_name] == column_value]
+                if not result.empty:
+                    return result.to_string(index=False)
+                else:
+                    return f"No rows found for {column_name} = {column_value} in {file_name}"
             else:
-                return f"Row index {row_index} is out of range for {file_name}"
-        except ValueError:
-            return "Invalid row index. Please provide a number."
+                return f"Column {column_name} not found in {file_name}"
+        except Exception as e:
+            return f"Error processing request: {str(e)}"
     return f"No dataframe found for {file_name}"
 
 # Chat input and processing
@@ -176,22 +186,41 @@ if prompt := st.chat_input("Ask me anything..."):
     
     # Check if user is asking to fetch a row
     row_fetch_response = ""
+    relevant_file = None
     if "fetch row" in prompt.lower() or "get row" in prompt.lower():
-        words = prompt.split()
         try:
-            # Assuming format like "fetch row 5 from filename.csv"
-            row_index = None
+            # Handle queries like "fetch row for customer id CUST005 in filename.csv"
+            words = prompt.lower().split()
+            column_value = None
+            column_name = None
             file_name = None
+            
+            # Look for column value (e.g., CUST005)
             for i, word in enumerate(words):
-                if word.isdigit():
-                    row_index = word
+                if word.startswith("cust") and word.isalnum():  # Assuming customer IDs are alphanumeric
+                    column_value = word.upper()
                 elif any(word.endswith(ext) for ext in ['.csv', '.xlsx']):
                     file_name = word
+                elif "id" in word:
+                    column_name = "customer id"  # Adjust based on common column names
             
-            if row_index and file_name:
-                row_fetch_response = fetch_row(file_name, row_index)
+            if column_value and file_name:
+                relevant_file = file_name
+                row_fetch_response = fetch_row(file_name, column_name or "customer id", column_value)
+            elif column_value:
+                # Try all CSV/Excel files if no file specified
+                for fname in st.session_state.dataframes:
+                    if fname.endswith(('.csv', '.xlsx')):
+                        result = fetch_row(fname, column_name or "customer id", column_value)
+                        if not result.startswith(("No rows", "Column", "No dataframe", "Error")):
+                            row_fetch_response = result
+                            relevant_file = fname
+                            break
+                        row_fetch_response = result  # Store last result
+            else:
+                row_fetch_response = "Unable to process row fetch request. Please use format: 'fetch row for [column] [value] in [filename]'"
         except:
-            row_fetch_response = "Unable to process row fetch request. Please use format: 'fetch row [number] from [filename]'"
+            row_fetch_response = "Unable to process row fetch request. Please use format: 'fetch row for [column] [value] in [filename]'"
 
     # Prepare context
     context = f"""
@@ -205,8 +234,8 @@ if prompt := st.chat_input("Ask me anything..."):
     Please answer the question based on the provided context, row fetch result (if any), and your general knowledge.
     """
     
-    # Truncate context if necessary
-    context, messages_to_send = truncate_context(context, st.session_state.messages)
+    # Truncate context if necessary, prioritizing relevant file
+    context, messages_to_send = truncate_context(context, st.session_state.messages, relevant_file)
     
     try:
         # Create chat completion
@@ -216,7 +245,7 @@ if prompt := st.chat_input("Ask me anything..."):
                      [{"role": m["role"], "content": context + m["content"]} 
                       for m in messages_to_send],
             temperature=0.5,
-            max_tokens=5000  # Reduced to reserve space for response
+            max_tokens=5000
         )
         
         # Get AI response
