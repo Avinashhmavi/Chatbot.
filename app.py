@@ -6,6 +6,7 @@ from PyPDF2 import PdfReader
 from docx import Document
 import pandas as pd
 import math
+import tiktoken
 
 # Initialize session state
 if "messages" not in st.session_state:
@@ -33,6 +34,51 @@ def chunk_text(text, max_chunk_size=10000):
     for i in range(0, len(text), max_chunk_size):
         chunks.append(text[i:i + max_chunk_size])
     return chunks
+
+# Function to estimate tokens
+def estimate_tokens(text, model="gpt-4o"):
+    try:
+        encoding = tiktoken.encoding_for_model(model)
+        return len(encoding.encode(text))
+    except Exception:
+        # Fallback: rough estimate of 4 characters per token
+        return len(text) // 4
+
+# Function to truncate context to fit token limit
+def truncate_context(context, messages, max_tokens=25000, model="gpt-4o"):
+    system_prompt = "You are a helpful assistant."
+    total_tokens = estimate_tokens(system_prompt + context, model)
+    
+    # Estimate tokens for messages
+    message_tokens = sum(estimate_tokens(m["content"], model) for m in messages)
+    total_tokens += message_tokens
+    
+    # If within limit, return as is
+    if total_tokens <= max_tokens:
+        return context, messages
+    
+    # Truncate processed_text chunks first
+    processed_text = st.session_state.processed_text
+    while processed_text and total_tokens > max_tokens:
+        processed_text.pop()
+        context = f"""
+        User Question: {messages[-1]["content"]}
+        
+        Uploaded Files Context (chunked):
+        {'\n\n'.join(processed_text)}
+        
+        Row Fetch Result (if applicable): {row_fetch_response}
+        """
+        total_tokens = estimate_tokens(system_prompt + context, model) + message_tokens
+    
+    # If still over limit, truncate older messages
+    truncated_messages = messages.copy()
+    while truncated_messages and total_tokens > max_tokens and len(truncated_messages) > 1:
+        truncated_messages.pop(0)  # Remove oldest message
+        message_tokens = sum(estimate_tokens(m["content"], model) for m in truncated_messages)
+        total_tokens = estimate_tokens(system_prompt + context, model) + message_tokens
+    
+    return context, truncated_messages
 
 # Process uploaded files
 def process_files(uploaded_files):
@@ -140,7 +186,7 @@ if prompt := st.chat_input("Ask me anything..."):
         except:
             row_fetch_response = "Unable to process row fetch request. Please use format: 'fetch row [number] from [filename]'"
 
-    # Prepare context with all chunks
+    # Prepare context
     context = f"""
     User Question: {prompt}
     
@@ -152,15 +198,18 @@ if prompt := st.chat_input("Ask me anything..."):
     Please answer the question based on the provided context, row fetch result (if any), and your general knowledge.
     """
     
+    # Truncate context if necessary
+    context, messages_to_send = truncate_context(context, st.session_state.messages)
+    
     try:
         # Create chat completion
         response = client.chat.completions.create(
-            model="gpt-4o",  # Using a default OpenAI model
+            model="gpt-4o",
             messages=[{"role": "system", "content": "You are a helpful assistant."}] +
                      [{"role": m["role"], "content": context + m["content"]} 
-                      for m in st.session_state.messages],
+                      for m in messages_to_send],
             temperature=0.5,
-            max_tokens=10000
+            max_tokens=7000
         )
         
         # Get AI response
