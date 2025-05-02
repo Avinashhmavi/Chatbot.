@@ -1,12 +1,11 @@
 import streamlit as st
 import os
 import tempfile
-from openai import OpenAI
+from groq import Groq, RateLimitError
 from PyPDF2 import PdfReader
 from docx import Document
 import pandas as pd
-import math
-import tiktoken
+import time
 
 # Initialize session state
 if "messages" not in st.session_state:
@@ -42,17 +41,13 @@ def chunk_text(text, max_chunk_size=10000):
         chunks.append(text[i:i + max_chunk_size])
     return chunks
 
-# Function to estimate tokens
-def estimate_tokens(text, model="gpt-4o"):
-    try:
-        encoding = tiktoken.encoding_for_model(model)
-        return len(encoding.encode(text))
-    except Exception:
-        # Fallback: conservative estimate of 3 characters per token
-        return len(text) // 3
+# Function to estimate tokens (fallback for Groq models)
+def estimate_tokens(text, model="llama-3.3-70b-versatile"):
+    # Conservative estimate: 3 characters per token
+    return len(text) // 3
 
 # Function to truncate context to fit token limit
-def truncate_context(context, messages, relevant_file=None, max_tokens=15000, model="gpt-4o"):
+def truncate_context(context, messages, relevant_file=None, max_tokens=5000, model="llama-3.3-70b-versatile"):
     system_prompt = "You are a helpful assistant."
     total_tokens = estimate_tokens(system_prompt + context, model)
     
@@ -64,8 +59,8 @@ def truncate_context(context, messages, relevant_file=None, max_tokens=15000, mo
     if total_tokens <= max_tokens:
         return context, messages
     
-    # Prioritize chunks from relevant file (if specified)
-    processed_text = st.session_state.processed_text
+    # Prioritize chunks from relevant file
+    processed_text = st.session_state.processed_text.copy()
     if relevant_file:
         prioritized_chunks = [chunk for chunk in processed_text if relevant_file in chunk]
         other_chunks = [chunk for chunk in processed_text if relevant_file not in chunk]
@@ -78,18 +73,16 @@ def truncate_context(context, messages, relevant_file=None, max_tokens=15000, mo
         User Question: {messages[-1]["content"]}
         
         Uploaded Files Context (chunked):
-        {'\n\n'.join(processed_text)}
+        {'\n\n'.join(processed_text[:3])}  # Limit to 3 chunks
         
         Row Fetch Result (if applicable): {row_fetch_response}
         """
         total_tokens = estimate_tokens(system_prompt + context, model) + message_tokens
     
-    # If still over limit, truncate older messages
-    truncated_messages = messages.copy()
-    while truncated_messages and total_tokens > max_tokens and len(truncated_messages) > 1:
-        truncated_messages.pop(0)  # Remove oldest message
-        message_tokens = sum(estimate_tokens(m["content"], model) for m in truncated_messages)
-        total_tokens = estimate_tokens(system_prompt + context, model) + message_tokens
+    # Keep only the last 2 messages
+    truncated_messages = messages[-2:] if len(messages) > 2 else messages
+    message_tokens = sum(estimate_tokens(m["content"], model) for m in truncated_messages)
+    total_tokens = estimate_tokens(system_prompt + context, model) + message_tokens
     
     return context, truncated_messages
 
@@ -97,6 +90,7 @@ def truncate_context(context, messages, relevant_file=None, max_tokens=15000, mo
 def process_files(uploaded_files):
     all_text_chunks = []
     dataframes = {}
+    max_chunks_per_file = 3  # Limit chunks per file
     
     for file in uploaded_files:
         file_type = file.name.split(".")[-1]
@@ -106,13 +100,13 @@ def process_files(uploaded_files):
             if file_type == "pdf":
                 reader = PdfReader(file)
                 text = "".join([page.extract_text() for page in reader.pages])
-                chunks = chunk_text(text)
+                chunks = chunk_text(text)[:max_chunks_per_file]
                 all_text_chunks.extend([f"File: {file_name}\n{chunk}" for chunk in chunks])
                 
             elif file_type == "docx":
                 doc = Document(file)
                 text = "\n".join([para.text for para in doc.paragraphs])
-                chunks = chunk_text(text)
+                chunks = chunk_text(text)[:max_chunks_per_file]
                 all_text_chunks.extend([f"File: {file_name}\n{chunk}" for chunk in chunks])
                 
             elif file_type in ["csv", "xlsx"]:
@@ -121,12 +115,10 @@ def process_files(uploaded_files):
                 else:
                     df = pd.read_excel(file)
                 
-                # Store dataframe for row fetching
                 dataframes[file_name] = df
                 
-                # Convert to string for text context
-                text = df.to_string()
-                chunks = chunk_text(text)
+                text = df.head(30).to_string()  # Limit to first 30 rows
+                chunks = chunk_text(text)[:max_chunks_per_file]
                 all_text_chunks.extend([f"File: {file_name}\n{chunk}" for chunk in chunks])
                 
             else:
@@ -140,10 +132,13 @@ def process_files(uploaded_files):
 # Process files when uploaded
 if uploaded_files:
     st.session_state.processed_text, st.session_state.dataframes = process_files(uploaded_files)
+    total_tokens = sum(estimate_tokens(chunk) for chunk in st.session_state.processed_text)
+    if total_tokens > 4000:
+        st.warning("Uploaded files may exceed Groq's rate limits on the free tier. Consider smaller files or a paid plan.")
 
 # Main chat interface
 st.title("💬 Chat Assistant")
-st.caption("🚀 A chatbot powered by OpenAI")
+st.caption("🚀 A chatbot powered by Groq")
 
 # Display chat messages
 for message in st.session_state.messages:
@@ -155,7 +150,6 @@ def fetch_row(file_name, column_name, column_value):
     if file_name in st.session_state.dataframes:
         df = st.session_state.dataframes[file_name]
         try:
-            # Search for rows where the column matches the value
             if column_name in df.columns:
                 result = df[df[column_name] == column_value]
                 if not result.empty:
@@ -170,11 +164,11 @@ def fetch_row(file_name, column_name, column_value):
 
 # Chat input and processing
 if prompt := st.chat_input("Ask me anything..."):
-    # Initialize OpenAI client with API key from secrets
+    # Initialize Groq client
     try:
-        client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+        client = Groq(api_key=st.secrets["GROQ_API_KEY"])
     except Exception as e:
-        st.error("Error initializing OpenAI client. Please check your API key in secrets.")
+        st.error("Error initializing Groq client. Please check your API key in secrets.")
         st.stop()
 
     # Add user message to chat history
@@ -184,31 +178,28 @@ if prompt := st.chat_input("Ask me anything..."):
     with st.chat_message("user"):
         st.markdown(prompt)
     
-    # Check if user is asking to fetch a row
+    # Check for row fetch
     row_fetch_response = ""
     relevant_file = None
     if "fetch row" in prompt.lower() or "get row" in prompt.lower():
         try:
-            # Handle queries like "fetch row for customer id CUST005 in filename.csv"
             words = prompt.lower().split()
             column_value = None
             column_name = None
             file_name = None
             
-            # Look for column value (e.g., CUST005)
             for i, word in enumerate(words):
-                if word.startswith("cust") and word.isalnum():  # Assuming customer IDs are alphanumeric
+                if word.startswith("cust") and word.isalnum():
                     column_value = word.upper()
                 elif any(word.endswith(ext) for ext in ['.csv', '.xlsx']):
                     file_name = word
                 elif "id" in word:
-                    column_name = "customer id"  # Adjust based on common column names
+                    column_name = "customer id"
             
             if column_value and file_name:
                 relevant_file = file_name
                 row_fetch_response = fetch_row(file_name, column_name or "customer id", column_value)
             elif column_value:
-                # Try all CSV/Excel files if no file specified
                 for fname in st.session_state.dataframes:
                     if fname.endswith(('.csv', '.xlsx')):
                         result = fetch_row(fname, column_name or "customer id", column_value)
@@ -216,7 +207,7 @@ if prompt := st.chat_input("Ask me anything..."):
                             row_fetch_response = result
                             relevant_file = fname
                             break
-                        row_fetch_response = result  # Store last result
+                        row_fetch_response = result
             else:
                 row_fetch_response = "Unable to process row fetch request. Please use format: 'fetch row for [column] [value] in [filename]'"
         except:
@@ -231,23 +222,37 @@ if prompt := st.chat_input("Ask me anything..."):
     
     Row Fetch Result (if applicable): {row_fetch_response}
     
-    Please answer the question based on the provided context, row fetch result (if any), and your general knowledge.
+    Please answer based on the provided context, row fetch result (if any), and your general knowledge.
     """
     
-    # Truncate context if necessary, prioritizing relevant file
+    # Truncate context
     context, messages_to_send = truncate_context(context, st.session_state.messages, relevant_file)
     
+    # Debug token usage
+    st.write(f"Estimated tokens: {estimate_tokens(context + ''.join(m['content'] for m in messages_to_send))}")
+    
     try:
-        # Create chat completion
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "system", "content": "You are a helpful assistant."}] +
-                     [{"role": m["role"], "content": context + m["content"]} 
-                      for m in messages_to_send],
-            temperature=0.5,
-            max_tokens=5000
-        )
-        
+        # Create chat completion with retry
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[{"role": "system", "content": "You are a helpful assistant."}] +
+                             [{"role": m["role"], "content": context + m["content"]} 
+                              for m in messages_to_send],
+                    temperature=0.5,
+                    max_tokens=32768
+                )
+                break
+            except RateLimitError as e:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    st.warning(f"Groq rate limit hit, retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    raise e
+    
         # Get AI response
         ai_response = response.choices[0].message.content
         
