@@ -7,6 +7,7 @@ from docx import Document
 import pandas as pd
 import time
 import re
+import uuid
 
 # Initialize session state
 if "messages" not in st.session_state:
@@ -15,6 +16,8 @@ if "processed_text" not in st.session_state:
     st.session_state.processed_text = []
 if "dataframes" not in st.session_state:
     st.session_state.dataframes = {}
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
 
 # Streamlit app configuration
 st.set_page_config(page_title="Chat Assistant", page_icon="🤖")
@@ -36,7 +39,7 @@ with st.sidebar:
         st.session_state.uploaded_files = uploaded_files
 
 # Function to chunk large text
-def chunk_text(text, max_chunk_size=5000):  # Reduced chunk size
+def chunk_text(text, max_chunk_size=3000):  # Further reduced chunk size
     chunks = []
     for i in range(0, len(text), max_chunk_size):
         chunks.append(text[i:i + max_chunk_size])
@@ -47,8 +50,16 @@ def estimate_tokens(text, model="llama-3.3-70b-versatile"):
     # Conservative estimate: 2 characters per token
     return len(text) // 2 + 100  # Add padding for safety
 
+# Function to reset session state
+def reset_session():
+    st.session_state.messages = []
+    st.session_state.processed_text = []
+    st.session_state.dataframes = {}
+    st.session_state.session_id = str(uuid.uuid4())
+    st.warning("Chat session has been reset due to approaching token limit. Starting fresh.")
+
 # Function to truncate context to fit token limit
-def truncate_context(context, messages, relevant_file=None, max_tokens=8000, model="llama-3.3-70b-versatile"):
+def truncate_context(context, messages, relevant_file=None, row_fetch_response="", max_tokens=7000, model="llama-3.3-70b-versatile"):
     system_prompt = "You are a helpful assistant."
     total_tokens = estimate_tokens(system_prompt + context, model)
     
@@ -56,11 +67,16 @@ def truncate_context(context, messages, relevant_file=None, max_tokens=8000, mod
     message_tokens = sum(estimate_tokens(m["content"], model) for m in messages)
     total_tokens += message_tokens
     
+    # If approaching limit, reset session
+    if total_tokens > 10000:
+        reset_session()
+        return "", []
+    
     # If within limit, return as is
     if total_tokens <= max_tokens:
         return context, messages
     
-    # Prioritize [
+    # Prioritize chunks from relevant file
     processed_text = st.session_state.processed_text.copy()
     if relevant_file:
         prioritized_chunks = [chunk for chunk in processed_text if relevant_file in chunk]
@@ -71,10 +87,10 @@ def truncate_context(context, messages, relevant_file=None, max_tokens=8000, mod
     while processed_text and total_tokens > max_tokens:
         processed_text.pop()
         context = f"""
-        User Question: {messages[-1]["content"]}
+        User Question: {messages[-1]["content"] if messages else ""}
         
-        Uploaded Files Context (chunked, limited to 2 chunks):
-        {'\n\n'.join(processed_text[:2])}  # Limit to 2 chunks
+        Uploaded Files Context (chunked, limited to 1 chunk):
+        {'\n\n'.join(processed_text[:1])}  # Limit to 1 chunk
         
         Row Fetch Result (if applicable): {row_fetch_response}
         """
@@ -91,7 +107,7 @@ def truncate_context(context, messages, relevant_file=None, max_tokens=8000, mod
 def process_files(uploaded_files):
     all_text_chunks = []
     dataframes = {}
-    max_chunks_per_file = 2  # Reduced to 2 chunks per file
+    max_chunks_per_file = 1  # Reduced to 1 chunk per file
     
     for file in uploaded_files:
         file_type = file.name.split(".")[-1]
@@ -118,7 +134,7 @@ def process_files(uploaded_files):
                 
                 dataframes[file_name] = df
                 
-                text = df.head(20).to_string()  # Limit to first 20 rows
+                text = df.head(10).to_string()  # Limit to first 10 rows
                 chunks = chunk_text(text)[:max_chunks_per_file]
                 all_text_chunks.extend([f"File: {file_name}\n{chunk}" for chunk in chunks])
                 
@@ -134,7 +150,7 @@ def process_files(uploaded_files):
 if uploaded_files:
     st.session_state.processed_text, st.session_state.dataframes = process_files(uploaded_files)
     total_tokens = sum(estimate_tokens(chunk) for chunk in st.session_state.processed_text)
-    if total_tokens > 6000:
+    if total_tokens > 5000:
         st.warning("Uploaded files may exceed Groq's token limits (12,000 TPM). Consider uploading smaller files or upgrading to a paid plan at https://console.groq.com/settings/billing.")
 
 # Main chat interface
@@ -214,8 +230,8 @@ if prompt := st.chat_input("Ask me anything..."):
     context = f"""
     User Question: {prompt}
     
-    Uploaded Files Context (chunked, limited to 2 chunks):
-    {'\n\n'.join(st.session_state.processed_text[:2])}
+    Uploaded Files Context (chunked, limited to 1 chunk):
+    {'\n\n'.join(st.session_state.processed_text[:1])}
     
     Row Fetch Result (if applicable): {row_fetch_response}
     
@@ -223,13 +239,11 @@ if prompt := st.chat_input("Ask me anything..."):
     """
     
     # Truncate context
-    context, messages_to_send = truncate_context(context, st.session_state.messages, relevant_file)
+    context, messages_to_send = truncate_context(context, st.session_state.messages, relevant_file, row_fetch_response)
     
     # Debug token usage
     total_tokens = estimate_tokens(context + ''.join(m['content'] for m in messages_to_send))
     st.write(f"Estimated tokens: {total_tokens}")
-    if total_tokens > 10000:
-        st.warning("Token usage is close to the limit. Response may be truncated.")
     
     try:
         # Create chat completion with retry
@@ -242,7 +256,7 @@ if prompt := st.chat_input("Ask me anything..."):
                              [{"role": m["role"], "content": context + m["content"]} 
                               for m in messages_to_send],
                     temperature=0.5,
-                    max_tokens=4000  # Reduced to reserve tokens
+                    max_tokens=3000  # Further reduced to reserve tokens
                 )
                 break
             except RateLimitError as e:
