@@ -23,10 +23,17 @@ st.set_page_config(page_title="Chat Assistant", page_icon="🤖")
 with st.sidebar:
     st.title("File Upload")
     uploaded_files = st.file_uploader(
-        "Upload files (PDF, Word, CSV, Excel)",
+        "Upload up to 4 files (PDF, Word, CSV, Excel)",
         type=["pdf", "docx", "csv", "xlsx"],
-        accept_multiple_files=True
+        accept_multiple_files=True,
+        help="You can upload a maximum of 4 files at once."
     )
+    
+    # Enforce maximum of 4 files
+    if uploaded_files and len(uploaded_files) > 4:
+        st.error("You can only upload up to 4 files. Please remove some files.")
+        uploaded_files = uploaded_files[:4]
+        st.session_state.uploaded_files = uploaded_files
 
 # Function to chunk large text
 def chunk_text(text, max_chunk_size=10000):
