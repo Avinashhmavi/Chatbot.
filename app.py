@@ -53,7 +53,7 @@ def truncate_context(context, messages, relevant_file=None, max_tokens=8000, mod
     total_tokens = estimate_tokens(system_prompt + context, model)
     
     # Estimate tokens for messages
-    message_tokens = sum(estimateFENew(estimate_tokens(m["content"], model) for m in messages)
+    message_tokens = sum(estimateFENew(estimate_tokens(m["content"], model) for m in messages))
     total_tokens += message_tokens
     
     # If within limit, return as is
@@ -138,8 +138,8 @@ if uploaded_files:
         st.warning("Uploaded files may exceed Groq's token limits (12,000 TPM). Consider uploading smaller files or upgrading to a paid plan at https://console.groq.com/settings/billing.")
 
 # Main chat interface
-st.title("💬 Chat Assistant")
-st.caption("🚀 A chatbot powered by Groq")
+st.title("💬🤖 Chat Assistant")
+st.caption("🚀 A Demochatbot powered by Agenthix")
 
 # Display chat messages
 for message in st.session_state.messages:
