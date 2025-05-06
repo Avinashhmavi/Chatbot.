@@ -24,6 +24,8 @@ if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
 if "file_keywords" not in st.session_state:
     st.session_state.file_keywords = []
+if "uploaded_images" not in st.session_state:
+    st.session_state.uploaded_images = {}
 
 # Streamlit app configuration
 st.set_page_config(page_title="Chat Assistant", page_icon="🤖")
@@ -62,6 +64,7 @@ def reset_session():
     st.session_state.processed_text = []
     st.session_state.dataframes = {}
     st.session_state.file_keywords = []
+    st.session_state.uploaded_images = {}
     st.session_state.session_id = str(uuid.uuid4())
     st.warning("Chat session has been reset due to approaching token limit. Starting fresh.")
 
@@ -127,14 +130,15 @@ def process_image(image_file):
         image.save(img_byte_arr, format=image.format)
         img_byte_arr = img_byte_arr.getvalue()
         base64_image = base64.b64encode(img_byte_arr).decode('utf-8')
-        return f"Image: {image_file.name}\n[Base64 encoded image data]"
+        return base64_image, image_file.name
     except Exception as e:
-        return f"Error processing image {image_file.name}: {str(e)}"
+        return None, f"Error processing image {image_file.name}: {str(e)}"
 
 # Process uploaded files
 def process_files(uploaded_files):
     all_text_chunks = []
     dataframes = {}
+    uploaded_images = {}
     max_chunks_per_file = 1
     file_names = [file.name for file in uploaded_files]
     
@@ -168,8 +172,12 @@ def process_files(uploaded_files):
                 all_text_chunks.extend([f"File: {file_name}\n{chunk}" for chunk in chunks])
                 
             elif file_type in ["png", "jpg", "jpeg"]:
-                image_content = process_image(file)
-                all_text_chunks.append(image_content)
+                base64_image, image_info = process_image(file)
+                if base64_image:
+                    uploaded_images[file_name] = base64_image
+                    all_text_chunks.append(f"Image: {file_name}\n[Image uploaded]")
+                else:
+                    all_text_chunks.append(image_info)
                 
             else:
                 all_text_chunks.append(f"Unsupported file type: {file_type} for file: {file_name}")
@@ -179,18 +187,18 @@ def process_files(uploaded_files):
     
     # Extract keywords after processing files
     file_keywords = extract_file_keywords(all_text_chunks, file_names)
-    return all_text_chunks, dataframes, file_keywords
+    return all_text_chunks, dataframes, file_keywords, uploaded_images
 
 # Process files when uploaded
 if uploaded_files:
-    st.session_state.processed_text, st.session_state.dataframes, st.session_state.file_keywords = process_files(uploaded_files)
+    st.session_state.processed_text, st.session_state.dataframes, st.session_state.file_keywords, st.session_state.uploaded_images = process_files(uploaded_files)
     total_tokens = sum(estimate_tokens(chunk) for chunk in st.session_state.processed_text)
     if total_tokens > 5000:
         st.warning("Uploaded files may exceed Groq's token limits (12,000 TPM). Consider uploading smaller files or upgrading to a paid plan at https://console.groq.com/settings/billing.")
 
 # Main chat interface
 st.title("💬 Chat Assistant")
-st.caption("🚀 A chatbot powered by Groq with OpenAI fallback, capable of answering based on files, images, and general knowledge")
+st.caption("🚀 A chatbot powered by Groq with OpenAI vision and fallback, capable of answering based on files, images, and general knowledge")
 
 # Display chat messages
 for message in st.session_state.messages:
@@ -214,18 +222,29 @@ def fetch_row(file_name, column_name, column_value):
             return f"Error processing request: {str(e)}"
     return f"No dataframe found for {file_name}"
 
-# Function to check if the prompt is related to uploaded files
-def is_prompt_related_to_files(prompt, file_keywords):
+# Function to check if the prompt is related to uploaded files or images
+def is_prompt_related_to_files_or_images(prompt, file_keywords, image_names):
+    if not prompt:
+        return False, False
     prompt_lower = prompt.lower()
     # Check for row fetch commands
     if "fetch row" in prompt_lower or "get row" in prompt_lower:
-        return True
+        return True, False
     
     # Check if prompt contains any file-related keywords
-    return any(keyword.lower() in prompt_lower for keyword in file_keywords)
+    is_file_related = any(keyword.lower() in prompt_lower for keyword in file_keywords)
+    
+    # Check if prompt references an image
+    is_image_related = any(image_name.lower() in prompt_lower for image_name in image_names) or "image" in prompt_lower
+    
+    return is_file_related, is_image_related
 
 # Chat input and processing
 if prompt := st.chat_input("Ask me anything..."):
+    if not prompt.strip():
+        st.error("Please enter a valid question or command.")
+        st.stop()
+    
     # Add user message to chat history
     st.session_state.messages.append({"role": "user", "content": prompt})
     
@@ -238,7 +257,7 @@ if prompt := st.chat_input("Ask me anything..."):
         groq_client = Groq(api_key=st.secrets["GROQ_API_KEY"])
         openai_client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
     except Exception as e:
-        st.error("Error initializing API clients. Please check your API keys in secrets.")
+        st.error(f"Error initializing API clients: {str(e)}. Please check your API keys in secrets.")
         st.stop()
 
     # Check for row fetch
@@ -268,8 +287,8 @@ if prompt := st.chat_input("Ask me anything..."):
                         row_fetch_response = result
             else:
                 row_fetch_response = "Unable to process row fetch request. Please use format: 'fetch row for [column] [value] in [filename]'"
-        except:
-            row_fetch_response = "Unable to process row fetch request. Please use format: 'fetch row for [column] [value] in [filename]'"
+        except Exception as e:
+            row_fetch_response = f"Error processing row fetch request: {str(e)}"
 
     # Prepare context
     context = f"""
@@ -284,37 +303,94 @@ if prompt := st.chat_input("Ask me anything..."):
     # Truncate context
     context, messages_to_send = truncate_context(context, st.session_state.messages, relevant_file, row_fetch_response)
     
+    # Check if prompt is related to files or images
+    is_file_related, is_image_related = is_prompt_related_to_files_or_images(
+        prompt, st.session_state.file_keywords, st.session_state.uploaded_images.keys()
+    )
+    
     # Debug token usage
     total_tokens = estimate_tokens(context + ''.join(m['content'] for m in messages_to_send))
     st.write(f"Estimated tokens: {total_tokens}")
     
     try:
-        # Try Groq first
-        try:
-            response = groq_client.chat.completions.create(
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
-                messages=[{"role": "system", "content": "You are a helpful assistant. Answer based on provided file content, image content, or general knowledge if no relevant files are provided."}] +
-                         [{"role": m["role"], "content": context + m["content"]} 
-                          for m in messages_to_send],
-                temperature=0.5,
-                max_tokens=3000
-            )
-            ai_response = response.choices[0].message.content
-        
-        except RateLimitError as e:
-            if "429" in str(e):  # Check for rate limit error
-                st.warning("Groq rate limit reached. Switching to OpenAI model (gpt-3.5-turbo).")
-                response = openai_client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=[{"role": "system", "content": "You are a helpful assistant. Answer based on provided file content, image content, or general knowledge if no relevant files are provided."}] +
-                             [{"role": m["role"], "content": context + m["content"]} 
-                              for m in messages_to_send],
+        if is_image_related:
+            # Find referenced image
+            referenced_image = None
+            for image_name in st.session_state.uploaded_images:
+                if image_name.lower() in prompt.lower():
+                    referenced_image = image_name
+                    break
+            
+            if referenced_image and referenced_image in st.session_state.uploaded_images:
+                # Use OpenAI's vision model for image analysis
+                try:
+                    response = openai_client.chat.completions.create(
+                        model="gpt-4o",
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": prompt},
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:image/jpeg;base64,{st.session_state.uploaded_images[referenced_image]}"
+                                        }
+                                    }
+                                ]
+                            }
+                        ],
+                        temperature=0.5,
+                        max_tokens=3000
+                    )
+                    ai_response = response.choices[0].message.content
+                except Exception as e:
+                    ai_response = f"Error processing image with vision model: {str(e)}"
+            else:
+                ai_response = "No relevant image found. Please specify the image name or upload an image."
+        else:
+            # Use Groq for file-related or general knowledge questions
+            try:
+                response = groq_client.chat.completions.create(
+                    model="meta-llama/llama-4-scout-17b-16e-instruct",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "You are a helpful assistant. Answer based on provided file content, or general knowledge if no relevant files are provided."
+                        }
+                    ] + [
+                        {"role": m["role"], "content": context + m["content"]}
+                        for m in messages_to_send
+                    ],
                     temperature=0.5,
                     max_tokens=3000
                 )
                 ai_response = response.choices[0].message.content
-            else:
-                raise e
+            except RateLimitError as e:
+                if "429" in str(e):
+                    st.warning("Groq rate limit reached. Switching to OpenAI model (gpt-3.5-turbo).")
+                    try:
+                        response = openai_client.chat.completions.create(
+                            model="gpt-3.5-turbo",
+                            messages=[
+                                {
+                                    "role": "system",
+                                    "content": "You are a helpful assistant. Answer based on provided file content, or general knowledge if no relevant files are provided."
+                                }
+                            ] + [
+                                {"role": m["role"], "content": context + m["content"]}
+                                for m in messages_to_send
+                            ],
+                            temperature=0.5,
+                            max_tokens=3000
+                        )
+                        ai_response = response.choices[0].message.content
+                    except Exception as e:
+                        ai_response = f"Error with OpenAI fallback: {str(e)}"
+                else:
+                    raise e
+            except Exception as e:
+                ai_response = f"Error with Groq API: {str(e)}"
         
         # Add AI response to chat history
         st.session_state.messages.append({"role": "assistant", "content": ai_response})
@@ -324,4 +400,4 @@ if prompt := st.chat_input("Ask me anything..."):
             st.markdown(ai_response)
     
     except Exception as e:
-        st.error(f"Error: {str(e)}")
+        st.error(f"Unexpected error: {str(e)}")
