@@ -197,8 +197,8 @@ if uploaded_files:
         st.warning("Uploaded files may exceed Groq's token limits (12,000 TPM). Consider uploading smaller files or upgrading to a paid plan at https://console.groq.com/settings/billing.")
 
 # Main chat interface
-st.title("💬 Chat Assistant")
-st.caption("🚀 A chatbot powered by Groq with OpenAI vision and fallback, capable of answering based on files, images, and general knowledge")
+st.title("💬🤖 Chat Assistant")
+st.caption("🚀 A chatbot capable of answering based on files, and general knowledge")
 
 # Display chat messages
 for message in st.session_state.messages:
